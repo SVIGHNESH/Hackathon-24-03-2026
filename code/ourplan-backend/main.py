@@ -2,8 +2,10 @@ import os
 import json
 import asyncio
 import uuid
+import smtplib
 from datetime import datetime
 from typing import Optional
+from email.message import EmailMessage
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,6 +27,14 @@ except Exception:
 
 app = FastAPI(title="Neurax API")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 class Task(BaseModel):
     id: str
     title: str
@@ -38,6 +48,7 @@ class Employee(BaseModel):
     role: str
     skills: list[str]
     experience: str
+    email: Optional[str] = ""
 
 class TaskAssignment(BaseModel):
     taskId: str
@@ -65,6 +76,10 @@ class CrewGenerateRequest(BaseModel):
 class CrewRunRequest(BaseModel):
     config: CrewConfig
 
+class CrewNotifyRequest(BaseModel):
+    config: CrewConfig
+    employees: list[Employee]
+
 async def call_llm(prompt: str) -> str:
     if not LLM_API_KEY:
         print("No LLM_API_KEY configured")
@@ -81,6 +96,32 @@ async def call_llm(prompt: str) -> str:
     except Exception as e:
         print(f"LLM exception: {e}")
         return ""
+
+def get_smtp_settings() -> dict:
+    return {
+        "host": os.getenv("SMTP_HOST", ""),
+        "port": int(os.getenv("SMTP_PORT", "587")),
+        "username": os.getenv("SMTP_USERNAME", ""),
+        "password": os.getenv("SMTP_PASSWORD", ""),
+        "from_email": os.getenv("SMTP_FROM_EMAIL", os.getenv("SMTP_USERNAME", "")),
+        "use_tls": os.getenv("SMTP_USE_TLS", "true").lower() == "true",
+        "use_ssl": os.getenv("SMTP_USE_SSL", "false").lower() == "true",
+    }
+
+def send_assignment_email(to_email: str, subject: str, body: str, settings: dict):
+    message = EmailMessage()
+    message["From"] = settings["from_email"]
+    message["To"] = to_email
+    message["Subject"] = subject
+    message.set_content(body)
+
+    smtp_factory = smtplib.SMTP_SSL if settings["use_ssl"] else smtplib.SMTP
+    with smtp_factory(settings["host"], settings["port"], timeout=20) as smtp:
+        if not settings["use_ssl"] and settings["use_tls"]:
+            smtp.starttls()
+        if settings["username"] and settings["password"]:
+            smtp.login(settings["username"], settings["password"])
+        smtp.send_message(message)
 
 @app.get("/")
 async def root():
@@ -169,8 +210,8 @@ async def parse_resume(files: list[UploadFile] = File(None)):
         print(f"Parsing resume: {file.filename}, text length: {len(content)}")
         llm_response = await call_llm(
             f"""You are an HR specialist. Extract employee information from this resume.
-Look for: name, job title/role, skills, years of experience.
-Return ONLY a valid JSON object like: {{"name": "John Doe", "role": "Software Engineer", "skills": ["Python", "Java"], "experience": "5 years"}}
+Look for: name, email, job title/role, skills, years of experience.
+Return ONLY a valid JSON object like: {{"name": "John Doe", "email": "john@example.com", "role": "Software Engineer", "skills": ["Python", "Java"], "experience": "5 years"}}
 If cannot find a field, use empty string "" instead of null.
 No markdown, no explanation, just the JSON.
 
@@ -189,9 +230,9 @@ Resume content:
     
     if not employees:
         employees = [
-            {"id": "1", "name": "Alex Chen", "role": "Frontend Developer", "skills": ["React", "TypeScript", "CSS", "Node.js"], "experience": "5 years"},
-            {"id": "2", "name": "Sarah Miller", "role": "Backend Developer", "skills": ["Python", "FastAPI", "PostgreSQL", "Docker"], "experience": "7 years"},
-            {"id": "3", "name": "James Wilson", "role": "Full Stack Developer", "skills": ["React", "Node.js", "Python", "SQL"], "experience": "4 years"},
+            {"id": "1", "name": "Alex Chen", "email": "alex.chen@example.com", "role": "Frontend Developer", "skills": ["React", "TypeScript", "CSS", "Node.js"], "experience": "5 years"},
+            {"id": "2", "name": "Sarah Miller", "email": "sarah.miller@example.com", "role": "Backend Developer", "skills": ["Python", "FastAPI", "PostgreSQL", "Docker"], "experience": "7 years"},
+            {"id": "3", "name": "James Wilson", "email": "james.wilson@example.com", "role": "Full Stack Developer", "skills": ["React", "Node.js", "Python", "SQL"], "experience": "4 years"},
         ]
     
     return {"employees": employees}
@@ -199,19 +240,23 @@ Resume content:
 @app.post("/crew-generate")
 async def crew_generate(request: CrewGenerateRequest):
     assignments = []
+    employee_task_counts = {emp.id: 0 for emp in request.employees}
     
     for task in request.tasks:
         best_match = None
         best_score = 0
         
         for emp in request.employees:
-            score = 0
             task_skills = set(s.lower() for s in task.requiredSkills)
             emp_skills = set(s.lower() for s in emp.skills)
             matches = len(task_skills & emp_skills)
             score = min(100, 50 + matches * 15)
-            
-            if score > best_score:
+
+            # If scores tie, prefer the employee with fewer assigned tasks
+            current_load = employee_task_counts.get(emp.id, 0)
+            best_load = employee_task_counts.get(best_match.id, 0) if best_match else float("inf")
+
+            if score > best_score or (score == best_score and current_load < best_load):
                 best_score = score
                 best_match = emp
         
@@ -223,6 +268,7 @@ async def crew_generate(request: CrewGenerateRequest):
                 "employeeName": best_match.name,
                 "matchScore": best_score
             })
+            employee_task_counts[best_match.id] = employee_task_counts.get(best_match.id, 0) + 1
     
     config = {
         "name": "Project Crew",
@@ -253,6 +299,71 @@ async def generate_logs(config: CrewConfig):
 @app.post("/crew-run-stream")
 async def crew_run_stream(request: CrewRunRequest):
     return StreamingResponse(generate_logs(request.config), media_type="text/event-stream")
+
+@app.post("/notify-assignments")
+async def notify_assignments(request: CrewNotifyRequest):
+    if not request.config.tasks:
+        raise HTTPException(status_code=400, detail="No assignments available to notify")
+
+    smtp_settings = get_smtp_settings()
+    if not smtp_settings["host"] or not smtp_settings["from_email"]:
+        raise HTTPException(
+            status_code=503,
+            detail="SMTP is not configured. Set SMTP_HOST and SMTP_FROM_EMAIL in backend .env",
+        )
+
+    employees_by_id = {str(emp.id): emp for emp in request.employees}
+    grouped_assignments: dict[str, list[TaskAssignment]] = {}
+    for assignment in request.config.tasks:
+        grouped_assignments.setdefault(str(assignment.employeeId), []).append(assignment)
+
+    sent = []
+    skipped = []
+
+    for employee_id, assignments in grouped_assignments.items():
+        employee = employees_by_id.get(employee_id)
+        if not employee:
+            skipped.append({"employeeId": employee_id, "reason": "Employee not found in request payload"})
+            continue
+
+        recipient = (employee.email or "").strip()
+        if not recipient or "@" not in recipient:
+            skipped.append({"employeeId": employee_id, "employeeName": employee.name, "reason": "Missing valid email"})
+            continue
+
+        task_lines = "\n".join(
+            [f"- {a.taskTitle} (match: {a.matchScore}%)" for a in assignments]
+        )
+        subject = f"[{request.config.name}] New Task Assignment"
+        body = (
+            f"Hello {employee.name},\n\n"
+            f"You have been assigned the following work items:\n"
+            f"{task_lines}\n\n"
+            f"Generated at: {request.config.generatedAt}\n\n"
+            "Please start with the highest-priority task first."
+        )
+
+        try:
+            send_assignment_email(recipient, subject, body, smtp_settings)
+            sent.append(
+                {
+                    "employeeId": employee_id,
+                    "employeeName": employee.name,
+                    "email": recipient,
+                    "taskCount": len(assignments),
+                }
+            )
+        except Exception as exc:
+            skipped.append(
+                {
+                    "employeeId": employee_id,
+                    "employeeName": employee.name,
+                    "email": recipient,
+                    "reason": f"Email send failed: {exc}",
+                }
+            )
+
+    return {"sent": sent, "skipped": skipped}
 
 @app.get("/crew-download")
 async def crew_download():
